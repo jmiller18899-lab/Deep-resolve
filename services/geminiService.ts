@@ -5,10 +5,23 @@ import { AnalysisResult } from "../types";
 // Using the complex task model with thinking config for deep reasoning
 const MODEL_NAME = "gemini-3-pro-preview";
 
+// API keys are sent verbatim as the `x-goog-api-key` HTTP header. Stray
+// whitespace, newlines, or wrapping quotes (common when pasting a key into a
+// .env file or secret store) make the header value invalid, and the browser
+// rejects it with the cryptic DOMException "The string did not match the
+// expected pattern.". Strip those characters before the key is ever used.
+const sanitizeApiKey = (raw: string | undefined): string => {
+  if (!raw) return "";
+  // Remove surrounding quotes, then all whitespace (incl. newlines/tabs).
+  return raw.trim().replace(/^['"]|['"]$/g, "").replace(/\s+/g, "");
+};
+
 export const analyzeProblem = async (problemDescription: string): Promise<AnalysisResult> => {
-  const apiKey = process.env.API_KEY;
+  const apiKey = sanitizeApiKey(process.env.API_KEY);
   if (!apiKey) {
-    throw new Error("API Key not found");
+    throw new Error(
+      "API Key not found. Set GEMINI_API_KEY in your environment before running the analysis."
+    );
   }
 
   const ai = new GoogleGenAI({ apiKey });
@@ -123,24 +136,44 @@ export const analyzeProblem = async (problemDescription: string): Promise<Analys
     required: ["selectedFrameworks", "reasoningChain", "rootCause", "finalAnswer", "discardedFrameworksSummary", "laymanSummary"]
   };
 
-  const response = await ai.models.generateContent({
-    model: MODEL_NAME,
-    contents: `THE PROBLEM: ${problemDescription}`,
-    config: {
-      systemInstruction: systemPrompt,
-      responseMimeType: "application/json",
-      responseSchema: responseSchema,
-      thinkingConfig: {
-        thinkingBudget: 4096 
+  let response;
+  try {
+    response = await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents: `THE PROBLEM: ${problemDescription}`,
+      config: {
+        systemInstruction: systemPrompt,
+        responseMimeType: "application/json",
+        responseSchema: responseSchema,
+        thinkingConfig: {
+          thinkingBudget: 4096
+        }
       }
+    });
+  } catch (e: any) {
+    // WebKit throws "The string did not match the expected pattern." when the
+    // request (typically the API-key header) contains invalid characters. That
+    // message is meaningless to a user, so translate it into something useful.
+    const raw = e?.message || String(e);
+    if (/did not match the expected pattern/i.test(raw)) {
+      throw new Error(
+        "The request could not be sent because the API key is malformed. " +
+          "Check that GEMINI_API_KEY contains no extra spaces, quotes, or line breaks."
+      );
     }
-  });
+    throw new Error(`The reasoning engine could not be reached: ${raw}`);
+  }
 
   const text = response.text;
   if (!text) throw new Error("No response from AI");
 
   try {
-    return JSON.parse(text) as AnalysisResult;
+    // The model occasionally wraps JSON in markdown code fences; strip them.
+    const cleaned = text
+      .trim()
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "");
+    return JSON.parse(cleaned) as AnalysisResult;
   } catch (e) {
     console.error("Failed to parse JSON", text);
     throw new Error("Invalid response format from AI");
